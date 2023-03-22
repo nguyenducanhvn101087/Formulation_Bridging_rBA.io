@@ -746,7 +746,7 @@ rownames(tmp_tab) <- CVs %>% names
 tmp_tab %>% kable()
 ```
 
-## Power for 24 Subjects and Various BE Margins and CV of `r CVs[CVs<=.5] %>% max`
+## Power for 24 Subjects and Various BE Margins and CV of 0.27
 ```{r }
 theta1 <- c(.8, .775, .75, .725, .7)
 theta2 <- 1/theta1
