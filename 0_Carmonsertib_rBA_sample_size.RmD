@@ -1,0 +1,804 @@
+---
+title: "Camonsertib rBA - BP44676"
+author: "Anh Nguyen Duc"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    theme: journal
+    highlight: pygments
+    number_sections: yes
+    self_contained: yes
+    toc: yes
+    toc_depth: 3
+    toc_float: yes
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+require(PowerTOST) # This is to calculate the sample size for cross-over design with known coefficient of variation (CV)
+require(MESS) # This is for function auc 
+require(tidyverse)
+require(knitr)
+require(PK)
+require(MASS)
+require(table1)
+require(haven)
+require(readxl)
+```
+
+## Questions for Clinical Pharmacology Team
++ Should the AUC be compartmental or non-compartmental? $\Rightarrow$ Answer: non-compartmental.
+
++ Current data does not seem to have variable describing if dosing was under fed or fasted condition or if Prepare is planning to create such a variable? $\Rightarrow$ Answer: for TRESR Module 1 - monotherapy dose escalation, all data was under fasted condition until protocol v7. CV could be based on this. 
+
++ CV should only consider 160mg mono-dose, what about dosing schedule? $\Rightarrow$ Answer:all dosing schedule should be considered.
+
++ If mono-dose should be used $\rightarrow$ we should consider either or both of
+
+  + TRESR Module 1: mono therapy dose escalation $\Rightarrow$ Answer:  all under fasted condition until protocol v7. CV could be based on this.
+  
+  + TRESR Module 2: mono therapy p2 (not sure how many patients we already have in the most recent Batch-28-20221108 transfer?)
+  
+  + Only mono-data should be used as confirmed by Marie-Laure.
+  
+  + Exact timing of dosing not available but for CV using nominal time would suffice.
+
+## Read Data
+
+### Data Derived by Roche PK Team
+```{r}
+nca_pk_dat <- read.csv(file = '../../0_Common/10_Data/4_PK_Parameters_Roche/RP3500_01_PKParameter.csv', header=T, sep = ';')
+
+# see number of pts
+nca_pk_dat$USUBJID %>% unique %>% length
+
+# extract data with 160mg irrespective of dosing schedule
+nca_pk_dat_160 <- nca_pk_dat %>% filter(TRTNAME %>% grepl(pattern='160', x=., fixed = TRUE))
+
+# sanity check
+nca_pk_dat_160$TRTNAME %>% unique
+
+# see number of pts
+nca_pk_dat_160$USUBJID %>% unique %>% length
+```
+
+### Raw SDTM Data from Repare
+```{r}
+# batch_sdtm <- '1_Batch-28-20221108'
+batch_sdtm <- '3_Batch-29-20230109-Dec2022ClinicalData'
+
+# For now we could only use SDTM
+
+# lb <- read_sas(data_file = '../../10_Data/3_Data_Transferred/1_Batch-28-20221108/CO44446_TRESR_RP_3500_01/sdtm/lb.sas7bdat')
+# 
+# pf <- read_sas(data_file = '../../10_Data/3_Data_Transferred/1_Batch-28-20221108/CO44446_TRESR_RP_3500_01/sdtm/pf.sas7bdat')
+
+ex <- read_sas(data_file = paste0('../../0_Common/10_Data/3_Data_Transferred/',batch_sdtm,'/CO44446_TRESR_RP_3500_01/sdtm/ex.sas7bdat') )
+
+ec <- read_sas(data_file = paste0('../../0_Common/10_Data/3_Data_Transferred/',batch_sdtm,'/CO44446_TRESR_RP_3500_01/sdtm/ec.sas7bdat'))
+
+pc <- read_sas(data_file = paste0('../../0_Common/10_Data/3_Data_Transferred/',batch_sdtm,'/CO44446_TRESR_RP_3500_01/sdtm/pc.sas7bdat'))
+
+# meal data
+ml <- read_sas(data_file = paste0('../../0_Common/10_Data/3_Data_Transferred/',batch_sdtm,'/CO44446_TRESR_RP_3500_01/sdtm/ml.sas7bdat'))
+
+# map PC to EX to figure out which dose each of the pc lines corresponds to via first merging by timing of sample collection. This is needed to extract only mono160mg data
+
+# remove empty concentration
+pc  <- pc[pc$PCORRES != '',] 
+
+# factorize the nominal PK collection timings for each dose
+pc$PCTPT_factor <- pc$PCTPT %>% factor(levels=c('PRE-DOSE', '0.5 HOURS POST DOSE', '1 HOUR POST DOSE', '2 HOURS POST DOSE', '4 HOURS POST DOSE', '6 HOURS POST DOSE', '8 HOURS POST DOSE', '10 HOURS POST DOSE', '12 HOURS POST DOSE', '24 HOURS POST DOSE', '48 HOURS POST DOSE')) %>% ordered
+
+tmp <- pc %>% group_by(USUBJID, VISIT) %>% summarise(PCRFTDTC_Date = PCRFTDTC[PCTPT_factor==PCTPT_factor%>%min])
+
+pc$PCRFTDTC_Date <- sapply(1:nrow(pc), function(id) {
+  sub <- pc$USUBJID[id]
+  vis <- pc$VISIT[id]
+  tmp$PCRFTDTC_Date[tmp$USUBJID==sub & tmp$VISIT==vis]
+})
+
+# Date conversion
+pc$PCRFTDTC_Date <- pc$PCRFTDTC_Date %>% as.Date
+
+# create nominal time
+pc %>% dplyr::select(USUBJID, VISIT, PCTPT_factor, PCORRES, PCRFTDTC, PCRFTDTC_Date) %>% head(20) %>% kable
+
+pc %>% dplyr::select(USUBJID, VISIT, PCTPT_factor, PCORRES, PCRFTDTC, PCRFTDTC_Date) %>% tail(20) %>% kable
+
+
+ex$EXSTDTC_Date  <- ex$EXSTDTC %>% as.Date
+ex$EXENDTC_Date  <- ex$EXENDTC %>% as.Date
+
+ex %>% dplyr::select(USUBJID, EXSTDTC_Date, EXENDTC_Date, EXDOSE) %>% filter(USUBJID=='RP-3500-01-1002-0151')
+
+tmp2 <- 
+pc %>% group_by(USUBJID, PCRFTDTC_Date) %>% summarise(EXDOSE = ex$EXDOSE[ex$USUBJID==unique(USUBJID) & (ex$EXSTDTC_Date<=unique(PCRFTDTC_Date) & ex$EXENDTC_Date>=unique(PCRFTDTC_Date) )]%>%unique %>% unlist) %>% na.omit
+
+ex %>% dplyr::select(USUBJID, EXSTDTC_Date, EXENDTC_Date, EXDOSE) %>% filter(USUBJID=='RP-3500-01-1001-0003')
+
+pc %>% dplyr::select(USUBJID, VISIT, PCTPT_factor, PCORRES, PCRFTDTC, PCRFTDTC_Date) %>% filter(USUBJID=='RP-3500-01-1001-0003')
+
+pc$EXDOSE <- sapply(1:nrow(pc), function(id) {
+  sub <- pc$USUBJID[id]
+  ref <- pc$PCRFTDTC_Date[id]
+  if (is.na(sub) | is.na(ref)) {
+    re <- NA
+  } else {
+    re <- tmp2$EXDOSE[tmp2$USUBJID==sub & tmp2$PCRFTDTC_Date==ref] %>% unique  
+  }
+  if (length(re)==0) re <- NA
+  re
+}) %>% unlist
+
+pc %>% dplyr::select(USUBJID, VISIT, PCTPT_factor, PCORRES, PCRFTDTC, PCRFTDTC_Date, EXDOSE) %>% head(20) %>% kable#filter(USUBJID=='RP-3500-01-1002-0151' & PCRFTDTC_Date=='2021-06-16')
+
+
+## extract module 1 and 2 patients
+pc <- pc %>% filter(USUBJID %>% substr(x=., start=12, stop=12) %in% c('1', '2'))
+pc$USUBJID %>% substr(x=., start=12, stop=15) %>% unique
+
+## extract patients with 160mg
+pc160 <- pc %>% filter(EXDOSE==160 & !is.na(PCSTRESN))
+
+## Compare pat id
+pc160_id <- pc160$USUBJID %>% unique # 84
+nca_pk_dat_160_id <- nca_pk_dat_160$USUBJID %>% unique # 77
+
+# print out patients 
+setdiff(pc160_id, nca_pk_dat_160_id) %>% kable
+setdiff(nca_pk_dat_160_id, pc160_id) %>% kable
+
+# so basically the PK team has fewer than 7 patients, which indeed had 160mg at some points
+ex %>% dplyr::select(USUBJID, EXSTDTC_Date, EXENDTC_Date, EXDOSE) %>% filter(USUBJID %in% setdiff(pc160_id, nca_pk_dat_160_id), EXDOSE==160) %>% dplyr::select(USUBJID) %>% unique
+
+
+# see food effect from pc
+pc %>% filter(grepl("Fed", VISIT), PCRFTDTC!='', EXDOSE==160) %>% dplyr::select(USUBJID, VISIT, PCRFTDTC, EXDOSE) %>% as.data.frame %>% kable()
+
+ml %>% as.data.frame %>% kable()
+
+ml %>% filter(USUBJID %in%pc160_id) %>% as.data.frame %>% kable()
+
+## so using VISIT column in pc or pc160 is a good idea
+pc160_fasted <- pc160 %>% filter(!grepl("Fed", VISIT))
+```
+
+### Derived PK Data from Repare
+
+Current data was transferred in batch 31
+
+```{r}
+nca_pk_dat_repare <- read_excel(path = '../../0_Common/10_Data/3_Data_Transferred/4_Batch-31-20230112/20230106 - Final Parameters Pivoted_120 patients_Roche (1).xlsx', sheet='Sheet1')
+nca_pk_dat_repare$USUBJID <- nca_pk_dat_repare$USUBJID %>% sapply(FUN=function(x) {
+  paste0('RP-3500-01-', substr(x = x, start=1, stop=4), '-',substr(x = x, start=5, stop=8))
+})
+
+nca_pk_dat_repare$AUC0_12 <- nca_pk_dat_repare$`AUC0-12`
+nca_pk_dat_repare <- nca_pk_dat_repare %>% as.data.frame
+
+# extract only module 1 and 2 patients
+nca_pk_dat_repare <- nca_pk_dat_repare %>% filter(USUBJID %>% substr(x=., start=12, stop=12) %in% c('1', '2'))
+
+# Remove data before dosing
+# nca_pk_dat_repare <- nca_pk_dat_repare %>% filter(Day>0) # does not really matter
+nca_pk_dat_repare_160 <- nca_pk_dat_repare %>% dplyr::filter(Dose =='160')
+
+# Check if all pts in repare derivation is in Anh's derivation
+nca_pk_dat_repare_160$USUBJID %>% unique %>% setdiff(x=., y=pc160_id) %>% kable
+nca_pk_dat_repare_160$USUBJID %>% unique %>% setdiff(y=., x=pc160_id) %>% kable
+nca_pk_dat_repare_160$USUBJID %>% unique %>% setdiff(x=., y=nca_pk_dat_160_id) %>% kable
+nca_pk_dat_repare_160$USUBJID %>% unique %>% setdiff(y=., x=nca_pk_dat_160_id) %>% kable
+```
+
+## Trial Design
+
++ For most recent details see slide 8 or 11 of this deck: https://docs.google.com/presentation/d/1O0r1Mx-feQiC3BfKAdGQg2lojBAn-Fml/edit#slide=id.p2
+
+
++ Primary endpoints: $AUC_{\infty}$, $AUC_{\text{last}}$ and $C_{\max}$
+
+## Estimation of Primary Endpoints for Each Patients and the Respective CV
+
+### Summary of Relevant PK Parameters
+
+#### Roche derivation
+
+```{r}
+table1(~AUCINF_obs%>%as.numeric+AUCINF_pred%>%as.numeric+AUCall%>%as.numeric+AUClast%>%as.numeric+Cmax%>%as.numeric+Clast%>%as.numeric, data=nca_pk_dat_160)
+```
+
+#### Repare derivation
+
+```{r}
+table1(~AUCINF_obs%>%as.numeric+AUC0_12%>%as.numeric+AUClast%>%as.numeric+Cmax%>%as.numeric, data=nca_pk_dat_repare_160)
+```
+
+### Estimate $AUC_{\infty}$
+
+**Questions**
+
++ Should we use `AUCINF_pred` or `AUCINF_obs`? In any case they are virtually similar as the plot below.
+
+```{r}
+with(nca_pk_dat_160, plot(x = AUCINF_obs %>% as.numeric, y = AUCINF_pred %>% as.numeric, col='blue'))
+abline(a=0, b=1)
+```
+
+**Estimation**
+<!-- To-do 
++ For self derivation, use function nca in package PK
+-->
+
+```{r}
+aucinf_anh <- pc160 %>% group_by(USUBJID, PCRFTDTC_Date) %>% summarise(AUCINF_obs=nca.complete(conc=PCSTRESN,                                     time=((PCDTC%>% as.POSIXct(format="%Y-%m-%dT%H:%M"))-
+       (PCDTC[1]%>% as.POSIXct(format="%Y-%m-%dT%H:%M"))) %>% as.numeric/3600
+  )$est['AUC to infinity',1]
+)
+
+aucinf_anh <- aucinf_anh %>% filter(AUCINF_obs >= 0)
+
+aucinf_anh_fasted <- pc160_fasted %>% group_by(USUBJID, PCRFTDTC_Date) %>% summarise(AUCINF_obs=nca.complete(conc=PCSTRESN,                                     time=((PCDTC%>% as.POSIXct(format="%Y-%m-%dT%H:%M"))-
+       (PCDTC[1]%>% as.POSIXct(format="%Y-%m-%dT%H:%M"))) %>% as.numeric/3600
+  )$est['AUC to infinity',1]
+)
+
+aucinf_anh_fasted <- aucinf_anh_fasted %>% filter(AUCINF_obs >= 0)
+```
+
+**Check if data is normally or log-normally distributed**
+
+```{r}
+# For Roche PK team derived data
+with(nca_pk_dat_160, {
+  x <- AUCINF_obs %>% as.numeric %>% na.omit
+  hist(AUCINF_obs %>% as.numeric %>% na.omit, freq=F)
+  fit<-fitdistr(x,"log-normal")$estimate
+  lines(dlnorm(0:max(x),fit[1],fit[2]), lwd=3)
+  }
+)
+
+nca_pk_dat_160$AUCINF_obs_log <- nca_pk_dat_160$AUCINF_obs %>% as.numeric %>% log
+
+with(nca_pk_dat_160, {
+  x <- AUCINF_pred %>% as.numeric %>% na.omit
+  hist(AUCINF_pred %>% as.numeric %>% na.omit, freq=F)
+  fit<-fitdistr(x,"log-normal")$estimate
+  lines(dlnorm(0:max(x),fit[1],fit[2]), lwd=3)
+  }
+)
+
+nca_pk_dat_160$AUCINF_pred_log <- nca_pk_dat_160$AUCINF_pred %>% as.numeric %>% log
+
+# For self-derived data
+with(aucinf_anh, {
+  x <- AUCINF_obs %>% as.numeric %>% na.omit
+  hist(AUCINF_obs %>% as.numeric %>% na.omit, freq=F)
+  fit<-fitdistr(x,"log-normal")$estimate
+  lines(dlnorm(0:max(x),fit[1],fit[2]), lwd=3)
+  }
+)
+aucinf_anh$AUCINF_obs_log <- aucinf_anh$AUCINF_obs %>% log
+
+with(aucinf_anh_fasted, {
+  x <- AUCINF_obs %>% as.numeric %>% na.omit
+  hist(AUCINF_obs %>% as.numeric %>% na.omit, freq=F)
+  fit<-fitdistr(x,"log-normal")$estimate
+  lines(dlnorm(0:max(x),fit[1],fit[2]), lwd=3)
+  }
+)
+aucinf_anh_fasted$AUCINF_obs_log <- aucinf_anh_fasted$AUCINF_obs %>% log
+
+# For repare-derived data 
+with(nca_pk_dat_repare_160, {
+  x <- AUCINF_obs %>% as.numeric %>% na.omit
+  hist(AUCINF_obs %>% as.numeric %>% na.omit, freq=F)
+  fit<-fitdistr(x,"log-normal")$estimate
+  lines(dlnorm(0:max(x),fit[1],fit[2]), lwd=3)
+  }
+)
+
+nca_pk_dat_repare_160$AUCINF_obs_log <- nca_pk_dat_repare_160$AUCINF_obs %>% as.numeric %>% log
+```
+
+**Estimate CV**
+
+<!-- To-do
++ Use anova to first get the mse = msq / df for residuals and get CV using mse2CV function in package PowerTOST
+-->
+
+```{r}
+# for Roche PK team derived data
+tmp_anova <- aov(AUCINF_obs_log ~ USUBJID, data = nca_pk_dat_160)
+mse       <- (tmp_anova$residuals ^ 2 %>% sum) / tmp_anova$df.residual
+
+(cv_aucinf_obs_log <- mse2CV(mse))
+
+# repeat for AUCIINF_pred
+tmp_anova <- aov(AUCINF_pred_log ~ USUBJID, data = nca_pk_dat_160)
+mse       <- (tmp_anova$residuals ^ 2 %>% sum) / tmp_anova$df.residual
+
+(cv_aucinf_pred_log <- mse2CV(mse))
+
+# repeat for self-derived data
+tmp_anova2 <- aov(AUCINF_obs_log ~ USUBJID, data = aucinf_anh)
+mse2       <- (tmp_anova2$residuals ^ 2 %>% sum) / tmp_anova2$df.residual
+
+(cv_aucinf_obs_log2 <- mse2CV(mse2))
+
+tmp_anova2_fasted <- aov(AUCINF_obs_log ~ USUBJID, data = aucinf_anh_fasted)
+mse2_fasted       <- (tmp_anova2_fasted$residuals ^ 2 %>% sum) / tmp_anova2_fasted$df.residual
+
+(cv_aucinf_obs_log2_fasted <- mse2CV(mse2_fasted))
+
+# For self-derived data and consider only pts appearing in repare's pk sets
+tmp_anova3 <- aov(AUCINF_obs_log ~ USUBJID, data = aucinf_anh %>% filter(USUBJID %in% (nca_pk_dat_repare_160$USUBJID %>% unique)) )
+mse3       <- (tmp_anova3$residuals ^ 2 %>% sum) / tmp_anova3$df.residual
+
+(cv_aucinf_obs_log3 <- mse2CV(mse3))
+
+tmp_anova3_fasted <- aov(AUCINF_obs_log ~ USUBJID, data = aucinf_anh_fasted %>% filter(USUBJID %in% (nca_pk_dat_repare_160$USUBJID %>% unique)))
+mse3_fasted       <- (tmp_anova3_fasted$residuals ^ 2 %>% sum) / tmp_anova3_fasted$df.residual
+
+(cv_aucinf_obs_log3_fasted <- mse2CV(mse3_fasted))
+
+# repeat for repare-derived data
+tmp_anova <- aov(AUCINF_obs_log ~ USUBJID, data = nca_pk_dat_repare_160)
+mse       <- (tmp_anova$residuals ^ 2 %>% sum) / tmp_anova$df.residual
+
+(cv_aucinf_obs_log_repare <- mse2CV(mse))
+```
+
+### Estimate $AUC_{\text{last}}$
+
+**Questions**
+
++ Should we use `AUClast` or `AUCall`? In any case they are virtually similar as the plot below.
+
+```{r}
+with(nca_pk_dat_160, plot(x = AUClast %>% as.numeric, y = AUCall %>% as.numeric, col='blue'))
+abline(a=0, b=1)
+```
+
+**Estimation**
+<!-- To-do 
++ For self derivation, use function nca in package PK
+-->
+
+```{r}
+auclast_anh <- pc160 %>% group_by(USUBJID, PCRFTDTC_Date) %>% summarise(AUClast=nca.complete(conc=PCSTRESN,                                     time=((PCDTC%>% as.POSIXct(format="%Y-%m-%dT%H:%M"))-
+       (PCDTC[1]%>% as.POSIXct(format="%Y-%m-%dT%H:%M"))) %>% as.numeric/3600
+  )$est['AUC to tlast',1]
+)
+
+
+auclast_anh_fasted <- pc160_fasted %>% group_by(USUBJID, PCRFTDTC_Date) %>% summarise(AUClast=nca.complete(conc=PCSTRESN,                                     time=((PCDTC%>% as.POSIXct(format="%Y-%m-%dT%H:%M"))-
+       (PCDTC[1]%>% as.POSIXct(format="%Y-%m-%dT%H:%M"))) %>% as.numeric/3600
+  )$est['AUC to tlast',1]
+)
+```
+
+**Check if data is normally or log-normally distributed**
+
+```{r}
+with(nca_pk_dat_160, {
+  x <- AUClast %>% as.numeric %>% na.omit
+  hist(AUClast %>% as.numeric %>% na.omit, freq=F, ylim=c(0, 2e-5))
+  fit<-fitdistr(x,"log-normal")$estimate
+  lines(dlnorm(0:max(x),fit[1],fit[2]), lwd=3)
+  }
+)
+
+nca_pk_dat_160$AUClast_log <- nca_pk_dat_160$AUClast %>% as.numeric %>% log
+
+with(nca_pk_dat_160, {
+  x <- AUCall %>% as.numeric %>% na.omit
+  hist(AUCall %>% as.numeric %>% na.omit, freq=F, ylim=c(0, 2e-5))
+  fit<-fitdistr(x,"log-normal")$estimate
+  lines(dlnorm(0:max(x),fit[1],fit[2]), lwd=3)
+  }
+)
+
+nca_pk_dat_160$AUCall_log <- nca_pk_dat_160$AUCall %>% as.numeric %>% log
+
+# self derived data
+with(auclast_anh , {
+  x <- AUClast %>% as.numeric %>% na.omit
+  hist(AUClast %>% as.numeric %>% na.omit, freq=F, ylim=c(0, 2e-5))
+  fit<-fitdistr(x,"log-normal")$estimate
+  lines(dlnorm(0:max(x),fit[1],fit[2]), lwd=3)
+  }
+)
+
+auclast_anh$AUClast_log <- auclast_anh$AUClast %>% log
+
+
+with(auclast_anh_fasted , {
+  x <- AUClast %>% as.numeric %>% na.omit
+  hist(AUClast %>% as.numeric %>% na.omit, freq=F, ylim=c(0, 2e-5))
+  fit<-fitdistr(x,"log-normal")$estimate
+  lines(dlnorm(0:max(x),fit[1],fit[2]), lwd=3)
+  }
+)
+
+auclast_anh_fasted$AUClast_log <- auclast_anh_fasted$AUClast %>% log
+```
+
+**Estimate CV**
+
+<!-- To-do
++ Use anova to first get the mse = msq / df for residuals and get CV using mse2CV function in package PowerTOST
+-->
+
+```{r}
+tmp_anova <- aov(AUClast_log ~ USUBJID, data = nca_pk_dat_160)
+mse       <- (tmp_anova$residuals ^ 2 %>% sum) / tmp_anova$df.residual
+
+(cv_auclast_log <- mse2CV(mse))
+
+# repeat for AUCIINF_pred
+tmp_anova <- aov(AUCall_log ~ USUBJID, data = nca_pk_dat_160)
+mse       <- (tmp_anova$residuals ^ 2 %>% sum) / tmp_anova$df.residual
+
+(cv_aucall_log <- mse2CV(mse))
+
+# repeat for self-derived AUClast
+tmp_anova2 <- aov(AUClast_log ~ USUBJID, data = auclast_anh)
+mse2       <- (tmp_anova2$residuals ^ 2 %>% sum) / tmp_anova2$df.residual
+
+(cv_auclast_log2 <- mse2CV(mse2))
+
+tmp_anova2_fasted <- aov(AUClast_log ~ USUBJID, data = auclast_anh_fasted)
+mse2_fasted       <- (tmp_anova2_fasted$residuals ^ 2 %>% sum) / tmp_anova2_fasted$df.residual
+
+(cv_auclast_log2_fasted <- mse2CV(mse2_fasted))
+```
+
+### Estimate $C_{\max}$
+
+**Estimation**
+
+<!-- To-do 
++ For self derivation, use function nca in package PK
+-->
+```{r}
+cmax_anh <- pc160 %>% group_by(USUBJID, PCRFTDTC_Date) %>% summarise(Cmax=PCSTRESN[PCTPT!='PRE-DOSE'] %>% max(na.rm = T), VISIT=VISIT[PCTPT!='PRE-DOSE'] %>%unique)
+
+cmax_anh$Cycle <- sapply(cmax_anh$VISIT, FUN = function(x) {
+  case_when(
+    x %>% grepl(x=., pattern='Fed Day') ~ 1,
+    x %>% grepl(x=., pattern='Cycle 1') ~ 1,
+    x %>% grepl(x=., pattern='Cycle 2') ~ 2,
+    x %>% grepl(x=., pattern='Cycle 3') ~ 3,
+    x %>% grepl(x=., pattern='Cycle 4') ~ 4
+  )  
+})
+
+cmax_anh$Day <- sapply(cmax_anh$VISIT, FUN = function(x) {
+  case_when(
+    x %>% grepl(x=., pattern='Fed Day') ~ -3,
+    x %>% grepl(x=., pattern='Day 1') ~ 1,
+    x %>% grepl(x=., pattern='Day 2') ~ 2,
+    x %>% grepl(x=., pattern='Day 3') ~ 3,
+    x %>% grepl(x=., pattern='Day 4') ~ 4,
+    x %>% grepl(x=., pattern='Day 5') ~ 5
+  )  
+})
+
+cmax_anh_fasted <- pc160_fasted %>% group_by(USUBJID, PCRFTDTC_Date) %>% summarise(Cmax=PCSTRESN[PCTPT!='PRE-DOSE'] %>% max(na.rm = T), VISIT=VISIT[PCTPT!='PRE-DOSE'] %>%unique)
+
+cmax_anh_fasted$Cycle <- sapply(cmax_anh_fasted$VISIT, FUN = function(x) {
+  case_when(
+    x %>% grepl(x=., pattern='Fed Day') ~ 1,
+    x %>% grepl(x=., pattern='Cycle 1') ~ 1,
+    x %>% grepl(x=., pattern='Cycle 2') ~ 2,
+    x %>% grepl(x=., pattern='Cycle 3') ~ 3,
+    x %>% grepl(x=., pattern='Cycle 4') ~ 4
+  )  
+})
+
+cmax_anh_fasted$Day <- sapply(cmax_anh_fasted$VISIT, FUN = function(x) {
+  case_when(
+    x %>% grepl(x=., pattern='Fed Day') ~ -3,
+    x %>% grepl(x=., pattern='Day 1') ~ 1,
+    x %>% grepl(x=., pattern='Day 2') ~ 2,
+    x %>% grepl(x=., pattern='Day 3') ~ 3,
+    x %>% grepl(x=., pattern='Day 4') ~ 4,
+    x %>% grepl(x=., pattern='Day 5') ~ 5
+  )  
+})
+```
+
+**Check if data is normally or log-normally distributed**
+
+```{r}
+# Roche PK team derived data
+with(nca_pk_dat_160, {
+  x <- Cmax %>% as.numeric %>% na.omit
+  hist(Cmax %>% as.numeric %>% na.omit, freq=F)
+  fit<-fitdistr(x,"log-normal")$estimate
+  lines(dlnorm(0:max(x),fit[1],fit[2]), lwd=3)
+  }
+)
+
+nca_pk_dat_160$Cmax_log <- nca_pk_dat_160$Cmax %>% as.numeric %>% log
+
+# Anh's derivation
+with(cmax_anh, {
+  x <- Cmax %>% as.numeric %>% na.omit
+  hist(Cmax %>% as.numeric %>% na.omit, freq=F)
+  fit<-fitdistr(x,"log-normal")$estimate
+  lines(dlnorm(0:max(x),fit[1],fit[2]), lwd=3)
+  }
+)
+
+cmax_anh$Cmax_log <- cmax_anh$Cmax %>% as.numeric %>% log
+
+
+with(cmax_anh_fasted, {
+  x <- Cmax %>% as.numeric %>% na.omit
+  hist(Cmax %>% as.numeric %>% na.omit, freq=F)
+  fit<-fitdistr(x,"log-normal")$estimate
+  lines(dlnorm(0:max(x),fit[1],fit[2]), lwd=3)
+  }
+)
+
+cmax_anh_fasted$Cmax_log <- cmax_anh_fasted$Cmax %>% as.numeric %>% log
+
+
+# Repare derived data
+with(nca_pk_dat_repare_160, {
+  x <- Cmax %>% as.numeric %>% na.omit
+  hist(Cmax %>% as.numeric %>% na.omit, freq=F)
+  fit<-fitdistr(x,"log-normal")$estimate
+  lines(dlnorm(0:max(x),fit[1],fit[2]), lwd=3)
+  }
+)
+
+nca_pk_dat_repare_160$Cmax_log <- nca_pk_dat_repare_160$Cmax %>% as.numeric %>% log
+
+# compare Anh's drivation vs Repare's 
+tmp <- cmax_anh #%>% filter(USUBJID %in% (nca_pk_dat_repare_160$USUBJID %>% unique))
+
+tmp_join <-
+inner_join(x=tmp %>% dplyr::select(USUBJID, PCRFTDTC_Date, Cmax, Cycle, Day), y=nca_pk_dat_repare_160 %>% dplyr::select(USUBJID, Cycle, Day, Cmax), by = c('USUBJID', 'Cycle', 'Day')) 
+
+tmp_join %>% kable
+```  
+
+**Estimate CV**
+
+<!-- To-do
++ Use anova to first get the mse = msq / df for residuals and get CV using mse2CV function in package PowerTOST
+-->
+
+```{r}
+# Roche PK team derived data
+tmp_anova <- aov(Cmax_log ~ USUBJID, data = nca_pk_dat_160)
+mse       <- (tmp_anova$residuals ^ 2 %>% sum) / tmp_anova$df.residual
+
+(cv_cmax_log <- mse2CV(mse))
+
+# Anh team derived data
+tmp_anova2 <- aov(Cmax_log ~ USUBJID, data = cmax_anh)
+mse2       <- (tmp_anova2$residuals ^ 2 %>% sum) / tmp_anova2$df.residual
+
+(cv_cmax_log2 <- mse2CV(mse2))
+
+tmp_anova2_fasted <- aov(Cmax_log ~ USUBJID, data = cmax_anh_fasted)
+mse2_fasted       <- (tmp_anova2_fasted$residuals ^ 2 %>% sum) / tmp_anova2_fasted$df.residual
+
+(cv_cmax_log2_fasted <- mse2CV(mse2_fasted))
+
+# For self-derived data and consider only pts appearing in repare's pk sets
+tmp_anova3 <- aov(Cmax_log ~ USUBJID, data = cmax_anh %>% filter(USUBJID %in% (nca_pk_dat_repare_160$USUBJID %>% unique)) )
+mse3       <- (tmp_anova3$residuals ^ 2 %>% sum) / tmp_anova3$df.residual
+
+(cv_cmax_log3 <- mse2CV(mse3))
+
+tmp_anova3_fasted <- aov(Cmax_log ~ USUBJID, data = cmax_anh_fasted %>% filter(USUBJID %in% (nca_pk_dat_repare_160$USUBJID %>% unique)) )
+mse3_fasted       <- (tmp_anova3_fasted$residuals ^ 2 %>% sum) / tmp_anova3_fasted$df.residual
+
+(cv_cmax_log3_fasted <- mse2CV(mse3_fasted))
+
+# Repare derived data
+tmp_anova <- aov(Cmax_log ~ USUBJID, data = nca_pk_dat_repare_160 #%>%filter(USUBJID!='RP-3500-01-1001-0007')
+                 )
+mse       <- (tmp_anova$residuals ^ 2 %>% sum) / tmp_anova$df.residual
+
+(cv_cmax_log_repare <- mse2CV(mse))
+
+# using the joint data set
+tmp_anova4 <- aov(I(Cmax.x %>% log) ~ USUBJID, data = tmp_join)
+mse4       <- (tmp_anova4$residuals ^ 2 %>% sum) / tmp_anova4$df.residual
+
+(cv_cmax_log4 <- mse2CV(mse4))
+
+tmp_anova5 <- aov(I((Cmax.y %>% as.numeric)%>%log) ~ USUBJID, data = tmp_join %>% filter(!USUBJID %in% c('RP-3500-01-3003-0217', 'RP-3500-01-1001-0007')))
+mse5       <- (tmp_anova5$residuals ^ 2 %>% sum) / tmp_anova5$df.residual
+
+(cv_cmax_log5 <- mse2CV(mse5))
+```
+
+
+### Estimate $C_{\text{last}}$
+
+**Estimation**
+
+<!-- To-do 
++ For self derivation, use function nca in package PK
+-->
+```{r}
+cvlast_anh <- pc160 %>% group_by(USUBJID, PCRFTDTC_Date) %>% summarise(Clast=PCSTRESN[PCTPT!='PRE-DOSE'] %>% na.omit %>% tail(1))
+
+cvlast_anh_fasted <- pc160_fasted %>% group_by(USUBJID, PCRFTDTC_Date) %>% summarise(Clast=PCSTRESN[PCTPT!='PRE-DOSE'] %>% na.omit %>% tail(1))
+```
+
+**Check if data is normally or log-normally distributed**
+
+```{r}
+with(nca_pk_dat_160, {
+  x <- Clast %>% as.numeric %>% na.omit
+  hist(Clast %>% as.numeric %>% na.omit, freq=F, ylim=c(0,20e-4))
+  fit<-fitdistr(x,"log-normal")$estimate
+  lines(dlnorm(0:max(x),fit[1],fit[2]), lwd=3)
+  }
+)
+
+nca_pk_dat_160$Clast_log <- nca_pk_dat_160$Clast %>% as.numeric %>% log
+
+# Anh's derivation
+with(cvlast_anh, {
+  x <- Clast %>% as.numeric %>% na.omit
+  hist(Clast %>% as.numeric %>% na.omit, freq=F, ylim=c(0,20e-4))
+  fit<-fitdistr(x,"log-normal")$estimate
+  lines(dlnorm(0:last(x),fit[1],fit[2]), lwd=3)
+  }
+)
+
+cvlast_anh$Clast_log <- cvlast_anh$Clast %>% as.numeric %>% log
+
+
+with(cvlast_anh_fasted, {
+  x <- Clast %>% as.numeric %>% na.omit
+  hist(Clast %>% as.numeric %>% na.omit, freq=F, ylim=c(0,20e-4))
+  fit<-fitdistr(x,"log-normal")$estimate
+  lines(dlnorm(0:last(x),fit[1],fit[2]), lwd=3)
+  }
+)
+
+cvlast_anh_fasted$Clast_log <- cvlast_anh_fasted$Clast %>% as.numeric %>% log
+```  
+
+**Estimate CV**
+
+<!-- To-do
++ Use anova to first get the mse = msq / df for residuals and get CV using mse2CV function in package PowerTOST
+-->
+
+```{r}
+tmp_anova <- aov(Clast_log ~ USUBJID, data = nca_pk_dat_160)
+mse       <- (tmp_anova$residuals ^ 2 %>% sum) / tmp_anova$df.residual
+
+(cv_clast_log <- mse2CV(mse))
+
+tmp_anova2 <- aov(Clast_log ~ USUBJID, data = cvlast_anh)
+mse2       <- (tmp_anova2$residuals ^ 2 %>% sum) / tmp_anova2$df.residual
+
+(cv_clast_log2 <- mse2CV(mse2))
+
+tmp_anova2_fasted <- aov(Clast_log ~ USUBJID, data = cvlast_anh_fasted)
+mse2_fasted       <- (tmp_anova2_fasted$residuals ^ 2 %>% sum) / tmp_anova2_fasted$df.residual
+
+(cv_clast_log2_fasted <- mse2CV(mse2_fasted))
+```
+
+## Sample Size Estimation
+
+### Requirements
+
+```{r }
+target_power <- .8 #.85, .9
+theta0      <- .95 #.9
+alpha       <- .1
+
+log_scale <- T
+
+CVs <- c('aucinf_obs_log' = cv_aucinf_obs_log,
+         'aucinf_pred_log' = cv_aucinf_pred_log,
+         'aucinf_obs_log2' = cv_aucinf_obs_log2,
+         'aucinf_obs_log2_fasted' = cv_aucinf_obs_log2_fasted,
+         'aucinf_obs_log3' = cv_aucinf_obs_log3,
+         'aucinf_obs_log3_fasted' = cv_aucinf_obs_log3_fasted,         
+         'aucinf_obs_log_repare'  = cv_aucinf_obs_log_repare,
+         'aucall_log' = cv_aucall_log,
+         'auclast_log' = cv_auclast_log,
+         'auclast_log2' = cv_auclast_log2,
+         'auclast_log2_fasted' = cv_auclast_log2_fasted,
+         'cmax_log' = cv_cmax_log,
+         'cmax_log2' = cv_cmax_log2,
+         'cmax_log2_fasted' = cv_cmax_log2_fasted,
+         'cmax_log3' = cv_cmax_log3,
+         'cmax_log3_fasted' = cv_cmax_log3_fasted,         
+         'cmax_log_repare' = cv_cmax_log_repare,
+         'cmax_log5'=cv_cmax_log5,
+         'clast_log' = cv_clast_log,
+         'nominal' = .27)
+
+N_total_2x2 <- sapply(CVs, function(x) {
+    sampleN.TOST(CV = x, alpha = alpha, targetpower = target_power, theta0=theta0, logscale = log_scale, design = '2x2', method = 'exact', robust = T, print = F)$`Sample size`
+}) # "robust" is not relevant for 2x2 design
+
+N_total_3x3 <- sapply(CVs, function(x) {
+    sampleN.TOST(CV = x, alpha = alpha, targetpower = target_power, theta0=theta0, logscale = log_scale, design = '3x3', method = 'exact', robust = T, print = F)$`Sample size`
+}) # for 3x3 "robust" to T tends to give  slightly larger sample size
+
+# Print results
+tmp_tab <-
+rbind(
+  CVs,
+  'N_total_2x2' = N_total_2x2,
+  'N_total_3x3' = N_total_3x3
+) %>% t
+
+rownames(tmp_tab) <- CVs %>% names
+tmp_tab %>% kable()
+```
+
+## Power for 24 Subjects and Various BE Margins and CV of `r CVs[CVs<=.5] %>% max`
+```{r }
+theta1 <- c(.8, .775, .75, .725, .7)
+theta2 <- 1/theta1
+maxCV  <- .27 # as written in protocol #CVs[CVs<=.5] %>% max
+n <- 24
+pows <- 
+sapply(theta1, function(x) power.TOST(CV = maxCV, alpha = alpha, n=n, theta0=theta0, theta1=x, logscale = log_scale, design = '3x3', method = 'exact', robust = T))
+
+cbind('low'=theta1, 'upp'=theta2, 'pow'=pows) %>% kable(digits = 3, row.names = F, caption = paste0('Power for various BE interval for ', n, ' subjects and', ' CV=', maxCV))
+``` 
+
+<!-- ## Code-testing Chunks to be Commented Out -->
+
+<!-- ```{r } -->
+<!-- # log_scale <- T -->
+<!-- # mean <- c(0.1262, 0.1406, 0.1655,  0.1392, 0.1508 ) -->
+<!-- # sd   <- c(0.0634, 0.0881, 0.05658, 0.0600, 0.07123) -->
+<!-- #  -->
+<!-- # CV   <- sd/mean -->
+<!-- # if (log_scale) CV <- sqrt(exp(sd^2)-1) -->
+
+<!-- log_scale <- T -->
+<!-- CV <- c(.05, .1, .15, .2, .25, .3, .35, .4, .45, .5) -->
+<!-- ``` -->
+
+<!-- ### Results for AB x BA - no food effect -->
+<!-- ```{r } -->
+<!-- N_total_2x2 <- sapply(CV, function(x) { -->
+<!--     sampleN.TOST(CV = x, alpha = .1, targetpower = .8, logscale = log_scale, design = '2x2', method = 'exact', robust = T, print = F)$`Sample size` -->
+<!-- }) # "robust" is not relevant for 2x2 design -->
+
+<!-- ``` -->
+
+
+<!-- ### Results for T_fa T_fe C_fa x C_fa T_fa T_fe x T_fe C_fa T_fa -->
+<!-- ```{r } -->
+<!-- N_total_3x3 <- sapply(CV, function(x) { -->
+<!--     sampleN.TOST(CV = x, alpha = .1, targetpower = .8, logscale = log_scale, design = '3x3', method = 'exact', robust = T, print = F)$`Sample size` -->
+<!-- }) # for 3x3 "robust" to T tends to give  slightly larger sample size -->
+<!-- ``` -->
+
+<!-- ### Display -->
+<!-- ```{r } -->
+<!-- rbind( -->
+<!--   'CV_logscale' = CV, -->
+<!--   'N_total_2x2' = N_total_2x2, -->
+<!--   'N_total_3x3' = N_total_3x3 -->
+<!-- ) %>% kable() -->
+<!-- ``` -->
+
+## Session Info
+
+```{r}
+sessionInfo()
+```
